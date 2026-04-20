@@ -1,0 +1,3 @@
+__version__ = "0.1.0"
+SCHEMA_VERSION = "0.2"
+SNAPSHOT_SCHEMA_VERSION = "0.3"

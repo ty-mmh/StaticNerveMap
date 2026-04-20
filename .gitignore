@@ -1,0 +1,14 @@
+.pytest_cache
+.runtime_scanner
+erpnext-develop
+home-assistant-core-dev
+static-nervemap
+Style-BERT-VITS2-GeneLab-Blackwell
+Voice-Design-Cloner
+CLAUDE.md
+CLAUDE.md
+src/staticnervemap/__pycache__
+tests
+docs
+src/staticnervemap.egg-info
+*.yaml
