@@ -294,6 +294,23 @@ def _expand_reachable_modules(root: Path, files: list[FileEntry]) -> set[str]:
     return reachable
 
 
+def compute_excluded_dirs(
+    root: Path,
+    *,
+    extra_excluded_dirs: set[str] | None = None,
+    use_gitignore: bool = True,
+    scan_mode: str = "default",
+) -> set[str]:
+    if scan_mode not in {"full", "default", "focused"}:
+        raise ValueError(f"unknown scan mode: {scan_mode}")
+    excluded_dirs = set(CORE_EXCLUDED_DIRS if scan_mode == "full" else DEFAULT_EXCLUDED_DIRS)
+    if extra_excluded_dirs:
+        excluded_dirs.update(extra_excluded_dirs)
+    if use_gitignore and scan_mode != "full":
+        excluded_dirs.update(_load_gitignore_excluded_dirs(root))
+    return excluded_dirs
+
+
 def scan_repo(
     root: Path,
     *,
@@ -305,14 +322,12 @@ def scan_repo(
     if not root.is_dir():
         raise NotADirectoryError(f"Not a directory: {root}")
 
-    if scan_mode not in {"full", "default", "focused"}:
-        raise ValueError(f"unknown scan mode: {scan_mode}")
-
-    excluded_dirs = set(CORE_EXCLUDED_DIRS if scan_mode == "full" else DEFAULT_EXCLUDED_DIRS)
-    if extra_excluded_dirs:
-        excluded_dirs.update(extra_excluded_dirs)
-    if use_gitignore and scan_mode != "full":
-        excluded_dirs.update(_load_gitignore_excluded_dirs(root))
+    excluded_dirs = compute_excluded_dirs(
+        root,
+        extra_excluded_dirs=extra_excluded_dirs,
+        use_gitignore=use_gitignore,
+        scan_mode=scan_mode,
+    )
 
     files: list[FileEntry] = []
     for dirpath, dirnames, filenames in _walk(root):

@@ -15,8 +15,9 @@ from . import SCHEMA_VERSION, SNAPSHOT_SCHEMA_VERSION, __version__
 from .api_contracts import build_api_contracts
 from .change_targets import build_change_targets, default_impact_rules
 from .clusters import build_clusters
-from .model import AnalysisResult, Note, Project, Unresolved
+from .model import AnalysisResult, Entrypoint, FileEntry, Note, Project, Relation, Unresolved
 from .modification_paths import build_modification_paths
+from .postprocess_lookup import build_file_lookup, resolve_relation_file_ids
 from .python_extractor import (
     collect_public_exports_for_file,
     finalize_param_type_hints,
@@ -25,7 +26,7 @@ from .python_extractor import (
     parse_file,
 )
 from .resolver import Resolver
-from .scanner import DEFAULT_EXCLUDED_DIRS, scan_repo
+from .scanner import _choose_primary_packages, compute_excluded_dirs, scan_repo
 from .unresolved_compression import compress_unresolved
 from .yaml_writer import dump_yaml
 
@@ -54,6 +55,67 @@ def _select_inference_budget(scan_mode: str, parsed_file_count: int) -> tuple[in
     if parsed_file_count >= 1500:
         return 2, "medium_repo_reduced"
     return 3, "default_full"
+
+
+def _select_postprocess_budget(scan_mode: str, relation_count: int) -> tuple[int | None, str]:
+    if relation_count < 10000:
+        return None, "full_relations"
+    if scan_mode == "focused":
+        return 12000, "focused_budgeted"
+    if relation_count >= 50000:
+        return 16000, "large_repo_budgeted"
+    return 24000, "default_budgeted"
+
+
+def _budget_postprocess_relations(
+    relations: list[Relation],
+    files: list[FileEntry],
+    entrypoints: list[Entrypoint],
+    max_relations: int | None,
+) -> tuple[list[Relation], bool]:
+    if max_relations is None or len(relations) <= max_relations:
+        return relations, False
+
+    lookup = build_file_lookup(files)
+    relation_counts: dict[str, int] = {}
+    hot_files: set[str] = set()
+
+    for entry in entrypoints:
+        file_id = lookup.resolve_file_id(entry.symbol_id)
+        if file_id is not None:
+            hot_files.add(file_id)
+
+    for file_entry in lookup.local_files:
+        if file_entry.role in {"entrypoint_candidate", "configuration"}:
+            hot_files.add(file_entry.id)
+
+    resolved_relations = resolve_relation_file_ids(relations, lookup)
+    for _, from_file, to_file in resolved_relations:
+        if from_file is not None:
+            relation_counts[from_file] = relation_counts.get(from_file, 0) + 1
+        if to_file is not None:
+            relation_counts[to_file] = relation_counts.get(to_file, 0) + 1
+
+    for file_id, _ in sorted(relation_counts.items(), key=lambda item: (-item[1], item[0]))[:200]:
+        hot_files.add(file_id)
+
+    prioritized: list[tuple[int, int, Relation]] = []
+    for idx, (rel, from_file, to_file) in enumerate(resolved_relations):
+        touches_hot = from_file in hot_files or to_file in hot_files
+        if rel.type in {"imports", "ui_binds", "route_binds", "command_binds", "inherits"}:
+            priority = 0
+        elif touches_hot:
+            priority = 1
+        elif rel.type == "calls":
+            priority = 2
+        else:
+            priority = 3
+        prioritized.append((priority, idx, rel))
+
+    prioritized.sort(key=lambda item: (item[0], item[1]))
+    kept = [rel for _, _, rel in prioritized[:max_relations]]
+    kept.sort(key=lambda rel: rel.id)
+    return kept, True
 
 
 def analyze(repo_root: Path, project_name: str, scan_mode: str = "default") -> AnalysisResult:
@@ -132,32 +194,53 @@ def analyze(repo_root: Path, project_name: str, scan_mode: str = "default") -> A
         primary_language="python",
     )
 
+    effective_excluded_dirs = compute_excluded_dirs(repo_root, scan_mode=scan_mode)
     analysis_meta = build_analysis_meta(project_name)
-    analysis_meta["scope"] = {
+    scope_meta: dict[str, Any] = {
         "included": ["**/*.py"],
-        "excluded": [f"{name}/" for name in sorted(DEFAULT_EXCLUDED_DIRS)],
+        "excluded": [f"{name}/" for name in sorted(effective_excluded_dirs)],
         "scan_mode": scan_mode,
     }
+    if scan_mode == "focused":
+        scope_meta["primary_packages"] = sorted(_choose_primary_packages(files))
+    analysis_meta["scope"] = scope_meta
 
-    api_contracts = build_api_contracts(all_files, all_symbols, all_relations)
+    postprocess_relation_budget, postprocess_mode = _select_postprocess_budget(
+        scan_mode,
+        len(all_relations),
+    )
+    postprocess_relations, postprocess_budget_applied = _budget_postprocess_relations(
+        all_relations,
+        all_files,
+        all_entrypoints,
+        postprocess_relation_budget,
+    )
+
+    p0 = time.perf_counter()
+    api_contracts = build_api_contracts(all_files, all_symbols, postprocess_relations)
+    p1 = time.perf_counter()
     change_targets = build_change_targets(
         files,
-        all_relations,
+        postprocess_relations,
         entrypoints=all_entrypoints,
         api_contracts=api_contracts,
     )
+    p2 = time.perf_counter()
     modification_paths = build_modification_paths(
-        all_relations,
+        postprocess_relations,
         all_symbols,
         entrypoints=all_entrypoints,
         change_targets=change_targets,
     )
-    clusters = build_clusters(all_files, all_relations, entrypoints=all_entrypoints)
+    p3 = time.perf_counter()
+    clusters = build_clusters(all_files, postprocess_relations, entrypoints=all_entrypoints)
+    p4 = time.perf_counter()
     all_unresolved = compress_unresolved(
         all_unresolved,
         files=all_files,
         symbols=all_symbols,
     )
+    p5 = time.perf_counter()
     t5 = time.perf_counter()
 
     analysis_meta["profiling"] = {
@@ -171,6 +254,14 @@ def analyze(repo_root: Path, project_name: str, scan_mode: str = "default") -> A
         "inference_mode": inference_mode,
         "infer_rounds_max": inference_rounds_max,
         "infer_rounds_used": infer_rounds_used,
+        "postprocess_mode": postprocess_mode,
+        "postprocess_budget_applied": postprocess_budget_applied,
+        "postprocess_relations_input": len(postprocess_relations),
+        "api_contracts_seconds": round(p1 - p0, 6),
+        "change_targets_seconds": round(p2 - p1, 6),
+        "modification_paths_seconds": round(p3 - p2, 6),
+        "clusters_seconds": round(p4 - p3, 6),
+        "unresolved_compression_seconds": round(p5 - p4, 6),
     }
     analysis_meta["counts"] = {
         "scanned_files": len(files),
@@ -290,8 +381,8 @@ def _resolve_roadmap_path(repo_root: Path, roadmap_ref: str | None) -> Path | No
     if not ref_path:
         return None
     candidates = [
-        Path.cwd() / ref_path,
         repo_root / ref_path,
+        Path.cwd() / ref_path,
     ]
     for candidate in candidates:
         if candidate.exists():
@@ -320,13 +411,15 @@ def _infer_milestone_title(repo_root: Path, roadmap_ref: str | None, milestone_i
     if phase_num is None:
         return None
 
-    phase_match = re.search(
+    heading_patterns = [
         rf"^##\s*フェーズ{phase_num}\s*:\s*(?P<title>.+?)\s*$",
-        text,
-        re.MULTILINE,
-    )
-    if phase_match:
-        return phase_match.group("title").strip()
+        rf"^##\s*Phase\s+{phase_num}\s*:\s*(?P<title>.+?)\s*$",
+        rf"^##\s*M0*{phase_num}\s*[:\-]\s*(?P<title>.+?)\s*$",
+    ]
+    for pattern in heading_patterns:
+        phase_match = re.search(pattern, text, re.MULTILINE)
+        if phase_match:
+            return phase_match.group("title").strip()
     return None
 
 
@@ -344,6 +437,19 @@ def _build_repo_fingerprint(result: AnalysisResult) -> dict[str, int]:
         "relation_count": len(result.relations),
         "unresolved_count": len(result.unresolved),
     }
+
+
+UNRESOLVED_HEAVY_ABSOLUTE_FLOOR = 10
+UNRESOLVED_HEAVY_RATIO_THRESHOLD = 0.05
+
+
+def _is_unresolved_heavy(result: AnalysisResult) -> bool:
+    medium_count = sum(1 for u in result.unresolved if u.severity == "medium")
+    if medium_count < UNRESOLVED_HEAVY_ABSOLUTE_FLOOR:
+        return False
+    symbol_count = len(result.symbols)
+    ratio = medium_count / max(symbol_count, 1)
+    return ratio >= UNRESOLVED_HEAVY_RATIO_THRESHOLD
 
 
 def _build_snapshot_summary(result: AnalysisResult) -> dict[str, Any]:
@@ -503,11 +609,14 @@ def create_snapshot(
     result = analyze(repo_root, project_name, scan_mode=scan_mode)
     if out_path is not None:
         snapshot_dir = out_path.parent
-        layered_root = snapshot_dir.parent
+        if snapshot_dir.name == "snapshots":
+            _ensure_layered_dirs(snapshot_dir.parent)
+        else:
+            snapshot_dir.mkdir(parents=True, exist_ok=True)
     else:
         layered_root = repo_root / "static-nervemap"
         snapshot_dir = layered_root / "snapshots"
-    _ensure_layered_dirs(layered_root)
+        _ensure_layered_dirs(layered_root)
     existing_snapshots = [
         snap for snap in _load_existing_snapshots(snapshot_dir)
         if snap.get("snapshot_id") != snapshot_id
@@ -524,7 +633,11 @@ def create_snapshot(
         stage=stage_value,
     )
     commit_hash, branch, git_dirty = _detect_git_context(repo_root)
-    stable = (not git_dirty) and stage_value in {"post", "baseline"}
+    stable = (
+        (not git_dirty)
+        and stage_value in {"post", "baseline"}
+        and not _is_unresolved_heavy(result)
+    )
 
     phase_ref = roadmap_ref
     if milestone_value and milestone_value.startswith("M") and milestone_value[1:].isdigit():
@@ -714,135 +827,10 @@ def _external_file_entry(module: str):
     )
 
 
-def main(argv: list[str] | None = None) -> int:
-    argv = list(argv or sys.argv[1:])
-    if argv[:2] == ["snapshot", "create"]:
-        parser = argparse.ArgumentParser(
-            prog="staticnervemap snapshot create",
-            description="Create a snapshot YAML with snapshot metadata.",
-        )
-        parser.add_argument("repo", type=Path, help="Target repository root")
-        parser.add_argument("--snapshot-id", type=str, required=True, help="Snapshot id")
-        parser.add_argument("--out", type=Path, default=None, help="Output yaml path")
-        parser.add_argument("--project-name", type=str, default=None, help="Project name")
-        parser.add_argument("--parent-snapshot-id", type=str, default=None, help="Parent snapshot id")
-        parser.add_argument("--milestone-id", type=str, default=None, help="Milestone id")
-        parser.add_argument("--stage", type=str, default=None, help="Snapshot stage")
-        parser.add_argument("--kind", type=str, default=None, help="Snapshot kind")
-        parser.add_argument("--roadmap-ref", type=str, default=None, help="Roadmap reference")
-        parser.add_argument("--change-reason", type=str, default="", help="Why this snapshot was taken")
-        parser.add_argument("--scope-note", type=str, default="", help="Scope note")
-        parser.add_argument(
-            "--scan-mode",
-            type=str,
-            choices=["full", "default", "focused"],
-            default="default",
-            help="Scan mode for repository traversal",
-        )
-        args = parser.parse_args(argv[2:])
+TOP_LEVEL_SUBCOMMANDS = ("analyze", "snapshot", "index")
 
-        repo_root: Path = args.repo.resolve()
-        if not repo_root.is_dir():
-            print(f"error: not a directory: {repo_root}", file=sys.stderr)
-            return 2
 
-        project_name = args.project_name or repo_root.name
-        snapshot_dir = (
-            args.out.parent
-            if args.out is not None
-            else _default_snapshot_output(repo_root, args.snapshot_id).parent
-        )
-        recommended_snapshot_id = suggest_snapshot_id(
-            repo_root=repo_root,
-            roadmap_ref=args.roadmap_ref,
-            stage=args.stage or _parse_snapshot_id(args.snapshot_id)[1],
-            snapshot_dir=snapshot_dir,
-        )
-        result, out_path = create_snapshot(
-            repo_root=repo_root,
-            project_name=project_name,
-            snapshot_id=args.snapshot_id,
-            out_path=args.out,
-            parent_snapshot_id=args.parent_snapshot_id,
-            milestone_id=args.milestone_id,
-            stage=args.stage,
-            kind=args.kind,
-            roadmap_ref=args.roadmap_ref,
-            change_reason=args.change_reason,
-            scope_note=args.scope_note,
-            scan_mode=args.scan_mode,
-        )
-        dump_yaml(result, out_path)
-        print(
-            f"ok: snapshot={args.snapshot_id} files={len(result.files)} symbols={len(result.symbols)} "
-            f"relations={len(result.relations)} unresolved={len(result.unresolved)}"
-        )
-        if recommended_snapshot_id != args.snapshot_id:
-            print(f"note: recommended_snapshot_id={recommended_snapshot_id}")
-        print(f"out: {out_path}")
-        return 0
-    if argv[:2] == ["snapshot", "suggest-id"]:
-        parser = argparse.ArgumentParser(
-            prog="staticnervemap snapshot suggest-id",
-            description="Suggest the next snapshot id from roadmap/stage/current snapshots.",
-        )
-        parser.add_argument("repo", type=Path, help="Target repository root")
-        parser.add_argument("--roadmap-ref", type=str, default=None, help="Roadmap reference")
-        parser.add_argument("--stage", type=str, default="post", help="Snapshot stage")
-        parser.add_argument("--snapshot-dir", type=Path, default=None, help="Snapshot directory")
-        args = parser.parse_args(argv[2:])
-
-        repo_root: Path = args.repo.resolve()
-        if not repo_root.is_dir():
-            print(f"error: not a directory: {repo_root}", file=sys.stderr)
-            return 2
-
-        suggested = suggest_snapshot_id(
-            repo_root=repo_root,
-            roadmap_ref=args.roadmap_ref,
-            stage=args.stage,
-            snapshot_dir=args.snapshot_dir,
-        )
-        print(f"suggested_snapshot_id: {suggested}")
-        return 0
-    if argv[:2] == ["index", "rebuild"]:
-        parser = argparse.ArgumentParser(
-            prog="staticnervemap index rebuild",
-            description="Rebuild index.yaml from snapshot YAML files.",
-        )
-        parser.add_argument("snapshot_dir", type=Path, help="Snapshot directory")
-        parser.add_argument("--out", type=Path, default=None, help="Output index path")
-        args = parser.parse_args(argv[2:])
-
-        snapshot_dir: Path = args.snapshot_dir.resolve()
-        if not snapshot_dir.is_dir():
-            print(f"error: not a directory: {snapshot_dir}", file=sys.stderr)
-            return 2
-        try:
-            index_doc, out_path = rebuild_index(snapshot_dir, args.out)
-        except ValueError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 2
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        with out_path.open("w", encoding="utf-8") as f:
-            yaml.safe_dump(
-                index_doc,
-                f,
-                allow_unicode=True,
-                sort_keys=False,
-                default_flow_style=False,
-                width=120,
-            )
-        print(
-            f"ok: snapshots={index_doc['index']['snapshot_count']} milestones={index_doc['index']['milestone_count']}"
-        )
-        print(f"out: {out_path}")
-        return 0
-
-    parser = argparse.ArgumentParser(
-        prog="staticnervemap",
-        description="Static analysis to yaml for AI-assisted modification bootstrap.",
-    )
+def _add_analyze_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("repo", type=Path, help="Target repository root")
     parser.add_argument("--out", type=Path, default=None, help="Output yaml path")
     parser.add_argument("--project-name", type=str, default=None, help="Project name")
@@ -853,8 +841,9 @@ def main(argv: list[str] | None = None) -> int:
         default="default",
         help="Scan mode for repository traversal",
     )
-    args = parser.parse_args(argv)
 
+
+def _run_analyze(args: argparse.Namespace) -> int:
     repo_root: Path = args.repo.resolve()
     if not repo_root.is_dir():
         print(f"error: not a directory: {repo_root}", file=sys.stderr)
@@ -874,3 +863,182 @@ def main(argv: list[str] | None = None) -> int:
     print(f"out: {out_path}")
     return 0
 
+
+def _run_snapshot_create(args: argparse.Namespace) -> int:
+    repo_root: Path = args.repo.resolve()
+    if not repo_root.is_dir():
+        print(f"error: not a directory: {repo_root}", file=sys.stderr)
+        return 2
+
+    project_name = args.project_name or repo_root.name
+    snapshot_dir = (
+        args.out.parent
+        if args.out is not None
+        else _default_snapshot_output(repo_root, args.snapshot_id).parent
+    )
+    recommended_snapshot_id = suggest_snapshot_id(
+        repo_root=repo_root,
+        roadmap_ref=args.roadmap_ref,
+        stage=args.stage or _parse_snapshot_id(args.snapshot_id)[1],
+        snapshot_dir=snapshot_dir,
+    )
+    result, out_path = create_snapshot(
+        repo_root=repo_root,
+        project_name=project_name,
+        snapshot_id=args.snapshot_id,
+        out_path=args.out,
+        parent_snapshot_id=args.parent_snapshot_id,
+        milestone_id=args.milestone_id,
+        stage=args.stage,
+        kind=args.kind,
+        roadmap_ref=args.roadmap_ref,
+        change_reason=args.change_reason,
+        scope_note=args.scope_note,
+        scan_mode=args.scan_mode,
+    )
+    dump_yaml(result, out_path)
+    print(
+        f"ok: snapshot={args.snapshot_id} files={len(result.files)} symbols={len(result.symbols)} "
+        f"relations={len(result.relations)} unresolved={len(result.unresolved)}"
+    )
+    if recommended_snapshot_id != args.snapshot_id:
+        print(f"note: recommended_snapshot_id={recommended_snapshot_id}")
+    print(f"out: {out_path}")
+    return 0
+
+
+def _run_snapshot_suggest_id(args: argparse.Namespace) -> int:
+    repo_root: Path = args.repo.resolve()
+    if not repo_root.is_dir():
+        print(f"error: not a directory: {repo_root}", file=sys.stderr)
+        return 2
+
+    suggested = suggest_snapshot_id(
+        repo_root=repo_root,
+        roadmap_ref=args.roadmap_ref,
+        stage=args.stage,
+        snapshot_dir=args.snapshot_dir,
+    )
+    print(f"suggested_snapshot_id: {suggested}")
+    return 0
+
+
+def _run_index_rebuild(args: argparse.Namespace) -> int:
+    snapshot_dir: Path = args.snapshot_dir.resolve()
+    if not snapshot_dir.is_dir():
+        print(f"error: not a directory: {snapshot_dir}", file=sys.stderr)
+        return 2
+    try:
+        index_doc, out_path = rebuild_index(snapshot_dir, args.out)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(
+            index_doc,
+            f,
+            allow_unicode=True,
+            sort_keys=False,
+            default_flow_style=False,
+            width=120,
+        )
+    print(
+        f"ok: snapshots={index_doc['index']['snapshot_count']} milestones={index_doc['index']['milestone_count']}"
+    )
+    print(f"out: {out_path}")
+    return 0
+
+
+def _build_main_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="staticnervemap",
+        description="Static analysis to yaml for AI-assisted modification bootstrap.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
+
+    analyze_parser = subparsers.add_parser(
+        "analyze",
+        help="Run a single-shot analysis and emit one YAML file.",
+        description="Analyze a repository and emit an analysis YAML.",
+    )
+    _add_analyze_args(analyze_parser)
+    analyze_parser.set_defaults(func=_run_analyze)
+
+    snapshot_parser = subparsers.add_parser(
+        "snapshot",
+        help="Snapshot commands.",
+        description="Create or inspect StaticNerveMap snapshots.",
+    )
+    snapshot_sub = snapshot_parser.add_subparsers(
+        dest="snapshot_command", required=True, metavar="SUBCOMMAND"
+    )
+
+    create_parser = snapshot_sub.add_parser(
+        "create",
+        help="Create a snapshot YAML with snapshot metadata.",
+        description="Create a snapshot YAML with snapshot metadata.",
+    )
+    create_parser.add_argument("repo", type=Path, help="Target repository root")
+    create_parser.add_argument("--snapshot-id", type=str, required=True, help="Snapshot id")
+    create_parser.add_argument("--out", type=Path, default=None, help="Output yaml path")
+    create_parser.add_argument("--project-name", type=str, default=None, help="Project name")
+    create_parser.add_argument("--parent-snapshot-id", type=str, default=None, help="Parent snapshot id")
+    create_parser.add_argument("--milestone-id", type=str, default=None, help="Milestone id")
+    create_parser.add_argument("--stage", type=str, default=None, help="Snapshot stage")
+    create_parser.add_argument("--kind", type=str, default=None, help="Snapshot kind")
+    create_parser.add_argument("--roadmap-ref", type=str, default=None, help="Roadmap reference")
+    create_parser.add_argument("--change-reason", type=str, default="", help="Why this snapshot was taken")
+    create_parser.add_argument("--scope-note", type=str, default="", help="Scope note")
+    create_parser.add_argument(
+        "--scan-mode",
+        type=str,
+        choices=["full", "default", "focused"],
+        default="default",
+        help="Scan mode for repository traversal",
+    )
+    create_parser.set_defaults(func=_run_snapshot_create)
+
+    suggest_parser = snapshot_sub.add_parser(
+        "suggest-id",
+        help="Suggest the next snapshot id from roadmap/stage/current snapshots.",
+        description="Suggest the next snapshot id from roadmap/stage/current snapshots.",
+    )
+    suggest_parser.add_argument("repo", type=Path, help="Target repository root")
+    suggest_parser.add_argument("--roadmap-ref", type=str, default=None, help="Roadmap reference")
+    suggest_parser.add_argument("--stage", type=str, default="post", help="Snapshot stage")
+    suggest_parser.add_argument("--snapshot-dir", type=Path, default=None, help="Snapshot directory")
+    suggest_parser.set_defaults(func=_run_snapshot_suggest_id)
+
+    index_parser = subparsers.add_parser(
+        "index",
+        help="Index commands.",
+        description="Rebuild or inspect the snapshot index.",
+    )
+    index_sub = index_parser.add_subparsers(
+        dest="index_command", required=True, metavar="SUBCOMMAND"
+    )
+    rebuild_parser = index_sub.add_parser(
+        "rebuild",
+        help="Rebuild index.yaml from snapshot YAML files.",
+        description="Rebuild index.yaml from snapshot YAML files.",
+    )
+    rebuild_parser.add_argument("snapshot_dir", type=Path, help="Snapshot directory")
+    rebuild_parser.add_argument("--out", type=Path, default=None, help="Output index path")
+    rebuild_parser.set_defaults(func=_run_index_rebuild)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(argv or sys.argv[1:])
+
+    # Backward-compat: `staticnervemap <repo>` keeps working as a default
+    # single-shot analyze. When the first token is not a known subcommand
+    # and not a flag, treat the whole argv as the analyze subcommand.
+    if argv and argv[0] not in TOP_LEVEL_SUBCOMMANDS and not argv[0].startswith("-"):
+        argv = ["analyze", *argv]
+
+    parser = _build_main_parser()
+    args = parser.parse_args(argv)
+    return args.func(args)

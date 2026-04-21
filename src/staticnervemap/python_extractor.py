@@ -87,7 +87,6 @@ LOW_VALUE_DYNAMIC_METHODS = {
     "parse_known_args",
     "pop",
     "pow",
-    "open",
     "read",
     "readlines",
     "relative_to",
@@ -95,27 +94,27 @@ LOW_VALUE_DYNAMIC_METHODS = {
     "rglob",
     "run_with_iobinding",
     "scale",
-    "sort",
     "size",
+    "sort",
     "split",
-    "startswith",
-    "state_dict",
-    "stat",
-    "sub",
     "squeeze",
+    "startswith",
+    "stat",
+    "state_dict",
     "step",
     "strip",
+    "sub",
     "sum",
     "to",
-    "transpose",
     "train",
+    "transpose",
     "unlink",
     "unscale_",
     "unsqueeze",
     "update",
     "view",
-    "write",
     "with_suffix",
+    "write",
     "zero_",
     "zero_grad",
 }
@@ -454,19 +453,7 @@ class RelationCollector(ast.NodeVisitor):
         self.generic_visit(node)
 
     def _resolve_from_module(self, node: ast.ImportFrom) -> str | None:
-        level = node.level or 0
-        base = node.module or ""
-        if level == 0:
-            return base or None
-        pkg_parts = self._package.split(".") if self._package else []
-        if level > len(pkg_parts):
-            return base or None
-        anchor = ".".join(pkg_parts[: len(pkg_parts) - level + 1]) if level > 0 else ""
-        # level=1 means "current package"; strip `level-1` parents from current package
-        pkg = ".".join(pkg_parts[: len(pkg_parts) - (level - 1)]) if level >= 1 else ""
-        if base:
-            return f"{pkg}.{base}" if pkg else base
-        return pkg or None
+        return _resolve_relative_module(node.level or 0, node.module or "", self._package)
 
     def _emit_import_relation(self, from_id: str, to_id: str, line: int) -> None:
         rid = _rel_id("imports", from_id, to_id, str(line))
@@ -918,25 +905,15 @@ class RelationCollector(ast.NodeVisitor):
         if isinstance(attr_node.value, ast.Name) and attr_node.value.id in {"self", "cls"}:
             class_qn = self._current_class_qualified_name()
             if class_qn is not None:
-                for kind in ("method", "function", "class"):
-                    sym = self.resolver.lookup_symbol(f"{class_qn}.{attr_node.attr}")
-                    if sym is not None:
-                        return sym.id
-                    prefixed = self.resolver.lookup_symbol(f"{class_qn}.{attr_node.attr}")
-                    if prefixed is not None:
-                        return prefixed.id
-                for kind in ("method", "function", "class"):
-                    candidate = f"{kind}:{class_qn}.{attr_node.attr}"
-                    sym = self.resolver.lookup_symbol(candidate.removeprefix(f"{kind}:"))
-                    if sym is not None:
-                        return sym.id
+                sym = self.resolver.lookup_symbol(f"{class_qn}.{attr_node.attr}")
+                if sym is not None:
+                    return sym.id
         if isinstance(attr_node.value, ast.Name):
             class_qn = self._resolve_bound_receiver_class_qn(attr_node.value.id)
             if class_qn is not None:
-                for kind in ("method", "function", "class"):
-                    sym = self.resolver.lookup_symbol(f"{class_qn}.{attr_node.attr}")
-                    if sym is not None:
-                        return sym.id
+                sym = self.resolver.lookup_symbol(f"{class_qn}.{attr_node.attr}")
+                if sym is not None:
+                    return sym.id
         # only resolve the simple pattern: Name(module_alias).attr
         if not isinstance(attr_node.value, ast.Name):
             return None
@@ -1166,6 +1143,26 @@ def _package_context(file_entry: FileEntry) -> str:
     return _package_of(file_entry.module)
 
 
+def _resolve_relative_module(level: int, base: str, pkg: str) -> str | None:
+    """Resolve a relative `from ... import` target into an absolute module name.
+
+    `level` is `node.level` (1+ for relative imports), `base` is `node.module or ""`,
+    and `pkg` is the importing file's current package as returned by
+    `_package_context`. Returns the absolute module path, or None when the import
+    climbs above the repository root with no remaining base name.
+    """
+    if level <= 0:
+        return base or None
+    pkg_parts = pkg.split(".") if pkg else []
+    keep = len(pkg_parts) - (level - 1)
+    if keep < 0:
+        return base or None
+    anchor = ".".join(pkg_parts[:keep]) if keep > 0 else ""
+    if base:
+        return f"{anchor}.{base}" if anchor else base
+    return anchor or None
+
+
 class ExportCollector(ast.NodeVisitor):
     def __init__(self, file_entry: FileEntry, resolver: Resolver) -> None:
         self.file = file_entry
@@ -1218,19 +1215,9 @@ class ExportCollector(ast.NodeVisitor):
         self.generic_visit(node)
 
     def _resolve_from_module(self, node: ast.ImportFrom) -> str | None:
-        level = node.level or 0
-        base = node.module or ""
-        if level == 0:
-            return base or None
-        pkg = _package_context(self.file)
-        pkg_parts = pkg.split(".") if pkg else []
-        if level > len(pkg_parts) + 1:
-            return base or None
-        keep = len(pkg_parts) - (level - 1)
-        anchor = ".".join(pkg_parts[:keep]) if keep > 0 else ""
-        if base:
-            return f"{anchor}.{base}" if anchor else base
-        return anchor or None
+        return _resolve_relative_module(
+            node.level or 0, node.module or "", _package_context(self.file)
+        )
 
     def _record_exports(self, value: ast.AST | None) -> None:
         if value is None:

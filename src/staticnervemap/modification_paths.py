@@ -3,6 +3,11 @@ from __future__ import annotations
 from collections import defaultdict, deque
 
 from .model import Entrypoint, Relation, Symbol
+from .postprocess_lookup import build_symbol_file_map
+
+
+MAX_PATH_DEPTH = 4
+MAX_PATHS_PER_GROUP = 2
 
 
 def build_modification_paths(
@@ -13,12 +18,17 @@ def build_modification_paths(
 ) -> list[dict[str, object]]:
     entrypoints = entrypoints or []
     change_targets = change_targets or []
-    symbol_to_file = {symbol.id: symbol.file_id for symbol in symbols}
+    symbol_to_file = build_symbol_file_map(symbols)
     symbol_by_id = {symbol.id: symbol for symbol in symbols}
-    runtime_primary = set()
+    runtime_primary: set[str] = set()
+    subsystem_primary: set[str] = set()
     for target in change_targets:
-        if target.get("id") == "change:runtime-core":
+        target_id = str(target.get("id") or "")
+        if target_id == "change:runtime-core":
             runtime_primary.update(str(file_id) for file_id in target.get("primary_files", []))
+        elif target_id.startswith("change:subsystem:"):
+            subsystem_primary.update(str(file_id) for file_id in target.get("primary_files", []))
+    destination_files = runtime_primary | subsystem_primary
 
     call_graph: dict[str, list[tuple[str, str]]] = defaultdict(list)
     for rel in relations:
@@ -44,7 +54,7 @@ def build_modification_paths(
             handler_id,
             call_graph,
             symbol_to_file,
-            runtime_primary,
+            destination_files,
         )
         for node_path, relation_path, target_file in discovered:
             dedupe_key = (trigger_source, target_file, tuple(node_path))
@@ -63,7 +73,9 @@ def build_modification_paths(
                     "path": node_path,
                     "relation_path": relation_path,
                     "target_file": target_file,
-                    "priority": _path_priority(node_path, target_file, runtime_primary),
+                    "priority": _path_priority(
+                        node_path, target_file, runtime_primary, subsystem_primary
+                    ),
                 }
             )
 
@@ -77,7 +89,7 @@ def build_modification_paths(
             handler_id,
             call_graph,
             symbol_to_file,
-            runtime_primary,
+            destination_files,
         )
         for node_path, relation_path, target_file in discovered:
             dedupe_key = (entrypoint.id, target_file, tuple(node_path))
@@ -96,7 +108,9 @@ def build_modification_paths(
                     "path": node_path,
                     "relation_path": relation_path,
                     "target_file": target_file,
-                    "priority": _path_priority(node_path, target_file, runtime_primary),
+                    "priority": _path_priority(
+                        node_path, target_file, runtime_primary, subsystem_primary
+                    ),
                 }
             )
 
@@ -117,8 +131,8 @@ def _discover_runtime_paths(
     handler_id: str,
     call_graph: dict[str, list[tuple[str, str]]],
     symbol_to_file: dict[str, str],
-    runtime_primary: set[str],
-    max_depth: int = 4,
+    destination_files: set[str],
+    max_depth: int = MAX_PATH_DEPTH,
 ) -> list[tuple[list[str], list[str], str]]:
     results: list[tuple[list[str], list[str], str]] = []
     queue: deque[tuple[str, list[str], list[str], int]] = deque()
@@ -128,7 +142,7 @@ def _discover_runtime_paths(
     while queue:
         current, node_path, rel_path, depth = queue.popleft()
         current_file = symbol_to_file.get(current)
-        if current_file in runtime_primary and len(node_path) > 1:
+        if current_file in destination_files and len(node_path) > 1:
             results.append((node_path, rel_path, current_file))
         if depth >= max_depth:
             continue
@@ -146,13 +160,14 @@ def _path_priority(
     node_path: list[str],
     target_file: str,
     runtime_primary: set[str],
+    subsystem_primary: set[str],
 ) -> int:
-    if target_file not in runtime_primary:
-        return 3
-    last_node = node_path[-1]
-    if last_node.startswith("method:"):
-        return 1
-    return 2
+    last_is_method = node_path[-1].startswith("method:")
+    if target_file in runtime_primary:
+        return 1 if last_is_method else 2
+    if target_file in subsystem_primary:
+        return 3 if last_is_method else 4
+    return 5
 
 
 def _prune_paths(paths: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -179,7 +194,7 @@ def _prune_paths(paths: list[dict[str, object]]) -> list[dict[str, object]]:
                 continue
             selected.append(item)
             seen_prefixes.append(node_tuple)
-            if len(selected) >= 2:
+            if len(selected) >= MAX_PATHS_PER_GROUP:
                 break
         kept.extend(selected)
     return kept

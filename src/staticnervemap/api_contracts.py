@@ -1,28 +1,31 @@
 from __future__ import annotations
 
 from .model import FileEntry, Relation, Symbol
+from .postprocess_lookup import build_file_lookup, build_symbol_file_map, resolve_relation_file_ids
 
 
 def build_api_contracts(
     files: list[FileEntry], symbols: list[Symbol], relations: list[Relation]
 ) -> list[dict[str, object]]:
     contracts: list[dict[str, object]] = []
-    file_map = {f.id: f for f in files}
+    lookup = build_file_lookup(files)
+    file_map = lookup.file_map
     symbol_counts_by_file: dict[str, int] = {}
     non_import_relation_counts: dict[str, int] = {}
-    external_imports_by_file = _external_imports_by_file(relations)
-    symbol_to_file_id = {symbol.id: symbol.file_id for symbol in symbols}
-    boundary_surface_files = _boundary_surface_files(relations, symbol_to_file_id)
+    resolved_relations = resolve_relation_file_ids(relations, lookup)
+    external_imports_by_file = _external_imports_by_file(resolved_relations)
+    symbol_to_file_id = build_symbol_file_map(symbols)
+    boundary_surface_files = _boundary_surface_files(resolved_relations, symbol_to_file_id)
 
     for symbol in symbols:
         if symbol.kind in {"function", "method", "class"}:
             symbol_counts_by_file[symbol.file_id] = symbol_counts_by_file.get(symbol.file_id, 0) + 1
 
-    for rel in relations:
+    for rel, from_file_id, to_file_id in resolved_relations:
         if rel.type == "imports":
             continue
-        for side in (rel.from_id, rel.to_id):
-            if side.startswith("file:"):
+        for side in (from_file_id, to_file_id):
+            if side and side.startswith("file:"):
                 non_import_relation_counts[side] = non_import_relation_counts.get(side, 0) + 1
 
     for symbol in symbols:
@@ -126,26 +129,31 @@ def _is_external_api_hotspot(
     return False
 
 
-def _external_imports_by_file(relations: list[Relation]) -> dict[str, set[str]]:
+def _external_imports_by_file(
+    resolved_relations: list[tuple[Relation, str | None, str | None]]
+) -> dict[str, set[str]]:
     by_file: dict[str, set[str]] = {}
-    for rel in relations:
+    for rel, from_file_id, _ in resolved_relations:
         if rel.type != "imports" or not rel.to_id.startswith("external:"):
             continue
-        if not rel.from_id.startswith("file:"):
+        if not from_file_id or not from_file_id.startswith("file:"):
             continue
-        by_file.setdefault(rel.from_id, set()).add(rel.to_id.removeprefix("external:"))
+        by_file.setdefault(from_file_id, set()).add(rel.to_id.removeprefix("external:"))
     return by_file
 
 
 def _boundary_surface_files(
-    relations: list[Relation],
+    resolved_relations: list[tuple[Relation, str | None, str | None]],
     symbol_to_file_id: dict[str, str],
 ) -> set[str]:
     file_ids: set[str] = set()
-    for rel in relations:
+    for rel, from_file_id, _ in resolved_relations:
         if rel.type not in {"ui_binds", "route_binds", "command_binds"}:
             continue
-        file_id = symbol_to_file_id.get(rel.from_id, rel.from_id if rel.from_id.startswith("file:") else "")
+        file_id = from_file_id or symbol_to_file_id.get(
+            rel.from_id,
+            rel.from_id if rel.from_id.startswith("file:") else "",
+        )
         if file_id.startswith("file:"):
             file_ids.add(file_id)
     return file_ids
