@@ -16,6 +16,7 @@ from .api_contracts import build_api_contracts
 from .change_targets import build_change_targets, default_impact_rules
 from .clusters import build_clusters
 from .model import AnalysisResult, Entrypoint, FileEntry, Note, Project, Relation, Unresolved
+from .metadata import collect_metadata_entrypoints
 from .modification_paths import build_modification_paths
 from .postprocess_lookup import build_file_lookup, resolve_relation_file_ids
 from .python_extractor import (
@@ -179,6 +180,13 @@ def analyze(repo_root: Path, project_name: str, scan_mode: str = "default") -> A
         all_entrypoints.extend(state.entrypoints)
         all_unresolved.extend(state.unresolved)
         all_notes.extend(state.notes)
+    all_entrypoints.extend(
+        collect_metadata_entrypoints(
+            repo_root=repo_root,
+            files=files,
+            symbols=all_symbols,
+        )
+    )
     t4 = time.perf_counter()
 
     # synthetic "external" file entries for external modules referenced
@@ -336,11 +344,17 @@ def _infer_snapshot_kind(stage: str) -> str:
 
 
 def _default_snapshot_output(repo_root: Path, snapshot_id: str) -> Path:
-    return repo_root / "static-nervemap" / "snapshots" / f"{snapshot_id}.yaml"
+    return repo_root / ".staticnervemap" / "snapshots" / f"{snapshot_id}.yaml"
+
+
+def _resolve_snapshot_output(repo_root: Path, snapshot_id: str, out_path: Path | None) -> tuple[Path, Path]:
+    final_out = out_path or _default_snapshot_output(repo_root, snapshot_id)
+    return final_out.parent, final_out
 
 
 def _ensure_layered_dirs(base_dir: Path) -> None:
     base_dir.mkdir(parents=True, exist_ok=True)
+    (base_dir / "work").mkdir(parents=True, exist_ok=True)
     (base_dir / "snapshots").mkdir(parents=True, exist_ok=True)
     (base_dir / "deltas").mkdir(parents=True, exist_ok=True)
 
@@ -384,6 +398,12 @@ def _resolve_roadmap_path(repo_root: Path, roadmap_ref: str | None) -> Path | No
         repo_root / ref_path,
         Path.cwd() / ref_path,
     ]
+    if ref_path.startswith("docs/") and not ref_path.startswith("docs/reference/"):
+        reference_ref_path = "docs/reference/" + ref_path.removeprefix("docs/")
+        candidates.extend([
+            repo_root / reference_ref_path,
+            Path.cwd() / reference_ref_path,
+        ])
     for candidate in candidates:
         if candidate.exists():
             return candidate
@@ -419,8 +439,40 @@ def _infer_milestone_title(repo_root: Path, roadmap_ref: str | None, milestone_i
     for pattern in heading_patterns:
         phase_match = re.search(pattern, text, re.MULTILINE)
         if phase_match:
+            english_title = _extract_phase_metadata_value(
+                text,
+                phase_match.end(),
+                "milestone_title_en",
+            )
+            if english_title:
+                return english_title
             return phase_match.group("title").strip()
     return None
+
+
+def _extract_phase_metadata_value(text: str, start_offset: int, key: str) -> str | None:
+    tail = text[start_offset:]
+    next_heading = re.search(r"^##\s+", tail, re.MULTILINE)
+    block = tail[: next_heading.start()] if next_heading else tail
+    match = re.search(rf"^\s*{re.escape(key)}\s*:\s*(?P<value>.+?)\s*$", block, re.MULTILINE)
+    if not match:
+        return None
+    value = match.group("value").strip()
+    return value or None
+
+
+def _prefer_milestone_title(
+    snapshot_title: str | None,
+    inferred_title: str | None,
+    milestone_id: str,
+) -> str:
+    if inferred_title and (not snapshot_title or not snapshot_title.isascii()):
+        return inferred_title
+    if snapshot_title:
+        return snapshot_title
+    if inferred_title:
+        return inferred_title
+    return milestone_id
 
 
 def _build_snapshot_tags(stage: str, milestone_id: str | None) -> list[str]:
@@ -453,6 +505,9 @@ def _is_unresolved_heavy(result: AnalysisResult) -> bool:
 
 
 def _build_snapshot_summary(result: AnalysisResult) -> dict[str, Any]:
+    file_by_id = {file_entry.id: file_entry.path for file_entry in result.files}
+    symbol_by_id = {symbol.id: symbol.qualified_name for symbol in result.symbols}
+    symbol_to_file = {symbol.id: symbol.file_id for symbol in result.symbols}
     top_change_targets = [
         target.get("id")
         for target in result.change_targets[:3]
@@ -464,35 +519,106 @@ def _build_snapshot_summary(result: AnalysisResult) -> dict[str, Any]:
         if isinstance(cluster, dict) and cluster.get("id")
     ]
     risk_summary: list[str] = []
+    bootstrap_summary: list[str] = []
     medium_unresolved = [u for u in result.unresolved if u.severity == "medium"]
     low_unresolved = [u for u in result.unresolved if u.severity == "low"]
-    if top_change_targets:
-        risk_summary.append(
-            f"改造の主対象候補は {top_change_targets[0]} を中心に読むのが自然。"
+    primary_change_target = _summarize_primary_change_target(
+        result.change_targets[0] if result.change_targets else None,
+        file_by_id,
+    )
+    primary_modification_path = _summarize_primary_modification_path(
+        result.modification_paths[0] if result.modification_paths else None,
+        file_by_id,
+        symbol_by_id,
+    )
+    primary_unresolved_risk = _summarize_primary_unresolved_risk(
+        medium_unresolved[0] if medium_unresolved else None,
+        file_by_id,
+        symbol_to_file,
+    )
+    recommended_reading_order = _build_recommended_reading_order(
+        result,
+        file_by_id,
+        symbol_to_file,
+        primary_change_target,
+        primary_modification_path,
+        primary_unresolved_risk,
+    )
+    entry_surface_files = _change_target_primary_files(
+        result.change_targets,
+        "change:entry-surface",
+        file_by_id,
+    )
+    reading_modes = _build_reading_modes(
+        recommended_reading_order,
+        primary_change_target,
+        primary_modification_path,
+        entry_surface_files,
+    )
+
+    if primary_change_target:
+        target_file = primary_change_target.get("primary_file") or primary_change_target["id"]
+        bootstrap_summary.append(
+            f"Primary hotspot: {target_file} via {primary_change_target['id']}."
         )
-    if medium_unresolved:
         risk_summary.append(
-            f"未解決 call が {len(medium_unresolved)} 件あり、追加調査が必要な箇所が残る。"
+            f"Primary modification target candidate: start from {target_file} via {primary_change_target['id']}."
+        )
+    if recommended_reading_order:
+        ordered = ", ".join(item["file"] for item in recommended_reading_order[:3])
+        bootstrap_summary.append(
+            f"Read in this order: {ordered}."
+        )
+    if primary_modification_path:
+        event_source = primary_modification_path["event_source"]
+        target_file = primary_modification_path["target_file"]
+        bootstrap_summary.append(
+            f"Follow {event_source} into {target_file} through {primary_modification_path['path_hint']}."
+        )
+        risk_summary.append(
+            f"Primary modification path: {event_source} reaches {target_file}."
+        )
+    elif result.modification_paths:
+        risk_summary.append(
+            f"{len(result.modification_paths)} UI-to-core modification paths are available."
+        )
+    elif primary_change_target:
+        risk_summary.append(
+            "Entry-to-core paths are weak; follow change targets and verify manually."
+        )
+    if primary_unresolved_risk:
+        location = primary_unresolved_risk.get("location") or primary_unresolved_risk["target"]
+        bootstrap_summary.append(
+            f"Re-check {location}: {primary_unresolved_risk['summary']}."
+        )
+        risk_summary.append(
+            f"Medium unresolved re-check: {location}."
+        )
+    elif medium_unresolved:
+        risk_summary.append(
+            f"{len(medium_unresolved)} medium unresolved calls remain and should be re-checked before core changes."
         )
     elif low_unresolved:
         risk_summary.append(
-            f"未解決項目は {len(low_unresolved)} 件だが、低信号なものが中心。"
+            f"{len(low_unresolved)} low-signal unresolved items remain."
         )
-    if result.modification_paths:
-        risk_summary.append(
-            f"UI から core への改造導線を {len(result.modification_paths)} 本保持している。"
-        )
-    elif top_change_targets:
-        risk_summary.append(
-            "入口から core までの導線は弱めなので、change target を起点に追うのが安全。"
+    if not bootstrap_summary and top_change_targets:
+        bootstrap_summary.append(
+            f"Start from {top_change_targets[0]} and verify the first related file manually."
         )
     if not risk_summary:
         risk_summary.append(
-            "大きな未解決や導線不足は目立たず、主要 change target から読み始めやすい。"
+            "No major unresolved or path gaps are visible; start from the primary change target."
         )
     return {
         "top_change_targets": top_change_targets,
         "top_clusters": top_clusters,
+        "primary_change_target": primary_change_target,
+        "primary_modification_path": primary_modification_path,
+        "primary_unresolved_risk": primary_unresolved_risk,
+        "recommended_reading_order": recommended_reading_order,
+        "reading_modes": reading_modes,
+        "bootstrap_summary": bootstrap_summary,
         "risk_summary": risk_summary,
     }
 
@@ -510,10 +636,329 @@ def _merge_index_summary(doc: dict[str, Any], snap: dict[str, Any]) -> dict[str,
         "top_clusters": snapshot_summary.get("top_clusters")
         or [c.get("id") for c in doc.get("clusters", [])[:3] if isinstance(c, dict)],
     }
+    for key in (
+        "primary_change_target",
+        "primary_modification_path",
+        "primary_unresolved_risk",
+        "recommended_reading_order",
+        "reading_modes",
+        "bootstrap_summary",
+    ):
+        value = snapshot_summary.get(key)
+        if value:
+            summary[key] = value
     risk_summary = snapshot_summary.get("risk_summary")
     if isinstance(risk_summary, list) and risk_summary:
         summary["risk_summary"] = risk_summary
     return summary
+
+
+def _build_reading_modes(
+    recommended_reading_order: list[dict[str, str]],
+    primary_change_target: dict[str, Any] | None,
+    primary_modification_path: dict[str, Any] | None,
+    entry_surface_files: set[str],
+) -> list[dict[str, Any]]:
+    modes: list[dict[str, Any]] = []
+    if recommended_reading_order:
+        modes.append(
+            {
+                "mode": "general",
+                "goal": "repo-wide modification bootstrap",
+                "confidence": "high",
+                "recommended_reading_order": recommended_reading_order,
+                "notes": ["Uses the existing repo-wide ranking."],
+            }
+        )
+
+    library_core_order = _build_library_core_reading_order(primary_change_target, entry_surface_files)
+    if library_core_order:
+        modes.append(
+            {
+                "mode": "library_core",
+                "goal": "inspect package-owned runtime and public core behavior",
+                "confidence": "high",
+                "recommended_reading_order": library_core_order,
+                "notes": ["Uses change:runtime-core primary files and avoids entry-surface dominance."],
+            }
+        )
+
+    entry_surface_order = _build_entry_surface_reading_order(entry_surface_files, primary_modification_path)
+    if entry_surface_order:
+        modes.append(
+            {
+                "mode": "entry_surface",
+                "goal": "inspect entry wiring and first handoff into runtime",
+                "confidence": "high",
+                "recommended_reading_order": entry_surface_order,
+                "notes": ["Uses entry-surface files and preserves entry-to-core handoff when visible."],
+            }
+        )
+    return modes
+
+
+def _build_library_core_reading_order(
+    primary_change_target: dict[str, Any] | None,
+    entry_surface_files: set[str],
+) -> list[dict[str, str]]:
+    if not isinstance(primary_change_target, dict):
+        return []
+    if primary_change_target.get("id") != "change:runtime-core":
+        return []
+    primary_files = [
+        str(file_path)
+        for file_path in primary_change_target.get("primary_files", [])
+        if isinstance(file_path, str) and file_path
+    ]
+    primary_files = [file_path for file_path in primary_files if file_path not in entry_surface_files]
+    return [
+        {
+            "rank": str(index),
+            "file": file_path,
+            "why": "runtime hotspot ranked highly by change-target scoring",
+        }
+        for index, file_path in enumerate(primary_files[:3], 1)
+    ]
+
+
+def _build_entry_surface_reading_order(
+    entry_surface_files: set[str],
+    primary_modification_path: dict[str, Any] | None,
+) -> list[dict[str, str]]:
+    ordered: list[tuple[str, str]] = []
+
+    def add(file_path: str | None, why: str) -> None:
+        if not file_path:
+            return
+        if any(existing == file_path for existing, _ in ordered):
+            return
+        ordered.append((file_path, why))
+
+    for file_path in sorted(entry_surface_files):
+        add(file_path, "entry surface that shapes external-to-runtime handoff")
+
+    if primary_modification_path:
+        add(
+            str(primary_modification_path.get("target_file") or ""),
+            "runtime target reached by the strongest entry path",
+        )
+
+    return [
+        {"rank": str(index), "file": file_path, "why": why}
+        for index, (file_path, why) in enumerate(ordered[:3], 1)
+    ]
+
+
+def _change_target_primary_files(
+    change_targets: list[dict[str, Any]],
+    target_id: str,
+    file_by_id: dict[str, str],
+) -> set[str]:
+    for target in change_targets:
+        if not isinstance(target, dict) or target.get("id") != target_id:
+            continue
+        return {
+            file_by_id.get(str(file_id), str(file_id))
+            for file_id in target.get("primary_files", [])
+        }
+    return set()
+
+
+def _summarize_primary_change_target(
+    target: dict[str, Any] | None,
+    file_by_id: dict[str, str],
+) -> dict[str, Any] | None:
+    if not isinstance(target, dict) or not target.get("id"):
+        return None
+    primary_files = [
+        file_by_id.get(str(file_id), str(file_id))
+        for file_id in target.get("primary_files", [])
+    ]
+    return {
+        "id": str(target["id"]),
+        "goal": str(target.get("goal") or ""),
+        "primary_file": primary_files[0] if primary_files else None,
+        "primary_files": primary_files[:3],
+    }
+
+
+def _summarize_primary_modification_path(
+    path: dict[str, Any] | None,
+    file_by_id: dict[str, str],
+    symbol_by_id: dict[str, str],
+) -> dict[str, Any] | None:
+    if not isinstance(path, dict):
+        return None
+    event_source = str(path.get("event_source") or path.get("trigger_source") or "")
+    target_file_id = str(path.get("target_file") or "")
+    if not event_source or not target_file_id:
+        return None
+    symbol_path = [
+        _symbol_tail(symbol_by_id.get(str(symbol_id), str(symbol_id)))
+        for symbol_id in path.get("path", [])
+    ]
+    path_hint = " -> ".join(symbol_path[:3]) if symbol_path else str(path.get("kind") or "path")
+    return {
+        "kind": str(path.get("kind") or ""),
+        "event_source": event_source,
+        "target_file": file_by_id.get(target_file_id, target_file_id),
+        "path_hint": path_hint,
+    }
+
+
+def _summarize_primary_unresolved_risk(
+    unresolved: Any,
+    file_by_id: dict[str, str],
+    symbol_to_file: dict[str, str],
+) -> dict[str, Any] | None:
+    if unresolved is None:
+        return None
+    file_id = _summary_file_id_from_target(str(getattr(unresolved, "target", "")), symbol_to_file)
+    file_path = file_by_id.get(file_id) if file_id else None
+    line_hint = getattr(unresolved, "line_hint", None)
+    location = f"{file_path}:{line_hint}" if file_path and line_hint else file_path
+    reason = str(getattr(unresolved, "reason", "") or "")
+    summary = reason.split("method call: ", 1)[1] if "method call: " in reason else reason
+    return {
+        "id": str(getattr(unresolved, "id", "")),
+        "target": str(getattr(unresolved, "target", "")),
+        "location": location,
+        "summary": summary,
+    }
+
+
+def _symbol_tail(symbol_name: str) -> str:
+    if "." in symbol_name:
+        return symbol_name.rsplit(".", 1)[-1]
+    return symbol_name
+
+
+def _summary_file_id_from_target(target: str, symbol_to_file: dict[str, str]) -> str | None:
+    if target.startswith("file:"):
+        return target
+    return symbol_to_file.get(target)
+
+
+def _build_recommended_reading_order(
+    result: AnalysisResult,
+    file_by_id: dict[str, str],
+    symbol_to_file: dict[str, str],
+    primary_change_target: dict[str, Any] | None,
+    primary_modification_path: dict[str, Any] | None,
+    primary_unresolved_risk: dict[str, Any] | None,
+) -> list[dict[str, str]]:
+    scores: dict[str, tuple[int, str]] = {}
+
+    def consider(file_path: str | None, score: int, why: str) -> None:
+        if not file_path:
+            return
+        current = scores.get(file_path)
+        if current is None or score > current[0]:
+            scores[file_path] = (score, why)
+
+    change_targets_by_id = {
+        str(target.get("id")): target
+        for target in result.change_targets
+        if isinstance(target, dict) and target.get("id")
+    }
+    entry_surface = change_targets_by_id.get("change:entry-surface")
+    entry_files: list[str] = []
+    if isinstance(entry_surface, dict):
+        entry_files = [
+            file_by_id.get(str(file_id), str(file_id))
+            for file_id in entry_surface.get("primary_files", [])
+        ]
+        if entry_files:
+            entry_score = 110 if primary_modification_path is None else 95
+            if _is_benchmark_or_example_path(entry_files[0]):
+                entry_score = 85 if primary_modification_path is None else 80
+            consider(
+                entry_files[0],
+                entry_score,
+                "entry surface still shapes the first handoff into core logic",
+            )
+
+    runtime_hotspot_files: list[str] = []
+    if primary_modification_path and result.modification_paths:
+        handler_file = file_by_id.get(
+            symbol_to_file.get(str(result.modification_paths[0].get("handler_symbol_id")), ""),
+            None,
+        )
+        handler_score = 115
+        if _is_benchmark_or_example_path(handler_file):
+            handler_score = 90
+        consider(handler_file, handler_score, "entry handler starts the strongest path into runtime")
+        consider(
+            str(primary_modification_path.get("target_file") or ""),
+            105,
+            "runtime target reached by the strongest modification path",
+        )
+
+    if primary_change_target:
+        runtime_hotspot_files = [str(file_path) for file_path in primary_change_target.get("primary_files", [])[:3]]
+        for idx, file_path in enumerate(runtime_hotspot_files):
+            consider(
+                str(file_path),
+                100 - idx * 5,
+                "runtime hotspot ranked highly by change-target scoring",
+            )
+
+    entry_config = change_targets_by_id.get("change:entry-config")
+    if isinstance(entry_config, dict):
+        config_files = [
+            file_by_id.get(str(file_id), str(file_id))
+            for file_id in entry_config.get("primary_files", [])
+        ]
+        for idx, file_path in enumerate(config_files[:2]):
+            consider(
+                file_path,
+                75 - idx * 5,
+                "bootstrap/config file can redirect startup and wiring",
+            )
+
+    if primary_unresolved_risk:
+        location = str(primary_unresolved_risk.get("location") or "")
+        file_path = location.split(":", 1)[0] if location else None
+        if file_path:
+            support_like = _is_support_like_reading_path(file_path)
+            if file_path in scores:
+                consider(file_path, scores[file_path][0] + 3, "re-check the remaining medium unresolved pivot")
+            elif primary_modification_path:
+                consider(
+                    file_path,
+                    82 if not support_like else 68,
+                    "re-check the remaining medium unresolved pivot",
+                )
+            elif entry_files or runtime_hotspot_files:
+                consider(
+                    file_path,
+                    78 if not support_like else 64,
+                    "re-check the remaining medium unresolved pivot",
+                )
+            else:
+                consider(file_path, 92 if not support_like else 72, "re-check the remaining medium unresolved pivot")
+
+    ordered = sorted(scores.items(), key=lambda item: (-item[1][0], item[0]))[:3]
+    return [
+        {"rank": str(index), "file": file_path, "why": meta[1]}
+        for index, (file_path, meta) in enumerate(ordered, 1)
+    ]
+
+
+def _is_benchmark_or_example_path(file_path: str | None) -> bool:
+    if not file_path:
+        return False
+    parts = file_path.split("/")
+    return any(part in {"benchmark", "benchmarks", "example", "examples"} for part in parts[:-1])
+
+
+def _is_support_like_reading_path(file_path: str) -> bool:
+    parts = file_path.split("/")
+    return (
+        file_path.startswith(("docs/", "doc/", "scripts/"))
+        or any(part in {"benchmark", "benchmarks", "example", "examples"} for part in parts[:-1])
+        or file_path.endswith("/conf.py")
+    )
 
 
 def _load_existing_snapshots(snapshot_dir: Path) -> list[dict[str, Any]]:
@@ -529,6 +974,13 @@ def _load_existing_snapshots(snapshot_dir: Path) -> list[dict[str, Any]]:
         if isinstance(snapshot, dict):
             loaded.append(snapshot)
     return loaded
+
+
+def _load_existing_snapshot_by_id(snapshot_dir: Path, snapshot_id: str) -> dict[str, Any] | None:
+    for snap in _load_existing_snapshots(snapshot_dir):
+        if snap.get("snapshot_id") == snapshot_id:
+            return snap
+    return None
 
 
 def _snapshot_stage_rank(stage: str | None) -> int:
@@ -577,7 +1029,7 @@ def suggest_snapshot_id(
     stage: str | None = None,
     snapshot_dir: Path | None = None,
 ) -> str:
-    snapshot_dir = snapshot_dir or (repo_root / "static-nervemap" / "snapshots")
+    snapshot_dir = snapshot_dir or (repo_root / ".staticnervemap" / "snapshots")
     milestone_id = _infer_milestone_from_roadmap_ref(roadmap_ref)
     prefix = milestone_id or "GEN"
     stage_value = stage or "post"
@@ -607,27 +1059,35 @@ def create_snapshot(
     scan_mode: str = "default",
 ) -> tuple[AnalysisResult, Path]:
     result = analyze(repo_root, project_name, scan_mode=scan_mode)
+    snapshot_dir, final_out = _resolve_snapshot_output(repo_root, snapshot_id, out_path)
     if out_path is not None:
-        snapshot_dir = out_path.parent
-        if snapshot_dir.name == "snapshots":
-            _ensure_layered_dirs(snapshot_dir.parent)
+        if final_out.parent.name == "snapshots":
+            _ensure_layered_dirs(final_out.parent.parent)
         else:
             snapshot_dir.mkdir(parents=True, exist_ok=True)
     else:
-        layered_root = repo_root / "static-nervemap"
+        layered_root = repo_root / ".staticnervemap"
         snapshot_dir = layered_root / "snapshots"
         _ensure_layered_dirs(layered_root)
+    existing_self = _load_existing_snapshot_by_id(snapshot_dir, snapshot_id)
     existing_snapshots = [
         snap for snap in _load_existing_snapshots(snapshot_dir)
         if snap.get("snapshot_id") != snapshot_id
     ]
-    sequence = _next_snapshot_sequence(snapshot_dir)
     inferred_milestone_id, inferred_stage = _parse_snapshot_id(snapshot_id)
     stage_value = stage or inferred_stage
     kind_value = kind or _infer_snapshot_kind(stage_value)
     roadmap_milestone_id = _infer_milestone_from_roadmap_ref(roadmap_ref)
     milestone_value = milestone_id or inferred_milestone_id or roadmap_milestone_id
-    parent_value = parent_snapshot_id or _infer_parent_snapshot_id(
+    existing_sequence = existing_self.get("sequence") if existing_self else None
+    try:
+        sequence = int(existing_sequence) if existing_sequence is not None else _next_snapshot_sequence(snapshot_dir)
+    except (TypeError, ValueError):
+        sequence = _next_snapshot_sequence(snapshot_dir)
+    existing_parent = existing_self.get("parent_snapshot_id") if existing_self else None
+    if existing_parent == snapshot_id:
+        existing_parent = None
+    parent_value = parent_snapshot_id or existing_parent or _infer_parent_snapshot_id(
         existing_snapshots,
         milestone_id=milestone_value,
         stage=stage_value,
@@ -670,7 +1130,6 @@ def create_snapshot(
         "repo_fingerprint": repo_fingerprint,
         "summary": summary,
     }
-    final_out = out_path or _default_snapshot_output(repo_root, snapshot_id)
     return result, final_out
 
 
@@ -697,7 +1156,7 @@ def rebuild_index(snapshot_dir: Path, out_path: Path | None = None) -> tuple[dic
     snapshot_files = sorted(snapshot_dir.glob("*.yaml"))
     if not snapshot_files:
         raise ValueError(
-            f"no snapshot yaml found in {snapshot_dir} (expected files under static-nervemap/snapshots)"
+            f"no snapshot yaml found in {snapshot_dir} (expected files under .staticnervemap/snapshots)"
         )
     loaded = [(path, _load_yaml(path)) for path in snapshot_files]
     loaded = [(path, doc) for path, doc in loaded if isinstance(doc.get("snapshot"), dict)]
@@ -731,7 +1190,7 @@ def rebuild_index(snapshot_dir: Path, out_path: Path | None = None) -> tuple[dic
 
         summary = _merge_index_summary(doc, snap)
         snapshot_entries[snapshot_id] = {
-            "file": f"static-nervemap/snapshots/{path.name}",
+            "file": f".staticnervemap/snapshots/{path.name}",
             "sequence": snap.get("sequence", 0),
             "kind": snap.get("kind"),
             "generated_at": snap.get("generated_at"),
@@ -748,15 +1207,17 @@ def rebuild_index(snapshot_dir: Path, out_path: Path | None = None) -> tuple[dic
         milestone_id = snap.get("milestone_id")
         if not milestone_id:
             continue
-        milestone_title = snap.get("milestone_title") or _infer_milestone_title(
+        snapshot_title = snap.get("milestone_title")
+        inferred_title = _infer_milestone_title(
             snapshot_dir.parent.parent,
             snap.get("roadmap_ref"),
             milestone_id,
         )
+        milestone_title = _prefer_milestone_title(snapshot_title, inferred_title, milestone_id)
         entry = milestone_entries.setdefault(
             milestone_id,
             {
-                "title": milestone_title or milestone_id,
+                "title": milestone_title,
                 "roadmap_ref": snap.get("roadmap_ref"),
                 "status": "planned",
                 "latest_snapshot_id": None,
@@ -767,7 +1228,11 @@ def rebuild_index(snapshot_dir: Path, out_path: Path | None = None) -> tuple[dic
                 "delta_ids": [],
             },
         )
-        if (not entry.get("title") or entry.get("title") == milestone_id) and milestone_title:
+        if milestone_title and (
+            not entry.get("title")
+            or entry.get("title") == milestone_id
+            or not str(entry.get("title")).isascii()
+        ):
             entry["title"] = milestone_title
         entry["snapshot_ids"].append(snapshot_id)
         entry["latest_snapshot_id"] = snapshot_id
@@ -804,8 +1269,9 @@ def rebuild_index(snapshot_dir: Path, out_path: Path | None = None) -> tuple[dic
             "milestone_count": len(milestone_entries),
         },
         "paths": {
-            "snapshots_dir": "static-nervemap/snapshots",
-            "deltas_dir": "static-nervemap/deltas",
+            "work_dir": ".staticnervemap/work",
+            "snapshots_dir": ".staticnervemap/snapshots",
+            "deltas_dir": ".staticnervemap/deltas",
         },
         "milestone_order": milestone_order,
         "snapshot_order": snapshot_order,
@@ -850,9 +1316,10 @@ def _run_analyze(args: argparse.Namespace) -> int:
         return 2
 
     project_name = args.project_name or repo_root.name
-    out_path: Path = args.out or (repo_root / ".staticnervemap" / "out.yaml")
+    out_path: Path = args.out or (repo_root / ".staticnervemap" / "work" / "out.yaml")
 
     result = analyze(repo_root, project_name, scan_mode=args.scan_mode)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     dump_yaml(result, out_path)
 
     print(
@@ -871,11 +1338,24 @@ def _run_snapshot_create(args: argparse.Namespace) -> int:
         return 2
 
     project_name = args.project_name or repo_root.name
-    snapshot_dir = (
-        args.out.parent
-        if args.out is not None
-        else _default_snapshot_output(repo_root, args.snapshot_id).parent
-    )
+    snapshot_dir, planned_out_path = _resolve_snapshot_output(repo_root, args.snapshot_id, args.out)
+    overwriting = planned_out_path.exists()
+    if overwriting and args.no_overwrite:
+        print(
+            f"error: snapshot already exists: {planned_out_path}",
+            file=sys.stderr,
+        )
+        print(
+            "hint: use `staticnervemap snapshot suggest-id` to choose an append-only snapshot id.",
+            file=sys.stderr,
+        )
+        return 2
+    if overwriting:
+        print(
+            f"warning: overwriting existing snapshot {args.snapshot_id}: {planned_out_path}",
+            file=sys.stderr,
+        )
+
     recommended_snapshot_id = suggest_snapshot_id(
         repo_root=repo_root,
         roadmap_ref=args.roadmap_ref,
@@ -902,8 +1382,15 @@ def _run_snapshot_create(args: argparse.Namespace) -> int:
         f"relations={len(result.relations)} unresolved={len(result.unresolved)}"
     )
     if recommended_snapshot_id != args.snapshot_id:
-        print(f"note: recommended_snapshot_id={recommended_snapshot_id}")
+        if overwriting:
+            print(
+                f"note: recommended_snapshot_id={recommended_snapshot_id} "
+                "(append-only candidate; current command overwrote the requested snapshot id)"
+            )
+        else:
+            print(f"note: recommended_snapshot_id={recommended_snapshot_id}")
     print(f"out: {out_path}")
+    print(f"next: staticnervemap index rebuild {out_path.parent}")
     return 0
 
 
@@ -923,8 +1410,19 @@ def _run_snapshot_suggest_id(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_snapshot_dir_arg(path: Path) -> Path:
+    resolved = path.resolve()
+    if (resolved / ".staticnervemap" / "snapshots").is_dir():
+        return resolved / ".staticnervemap" / "snapshots"
+    if (resolved / "static-nervemap" / "snapshots").is_dir():
+        return resolved / "static-nervemap" / "snapshots"
+    if (resolved / "snapshots").is_dir():
+        return resolved / "snapshots"
+    return resolved
+
+
 def _run_index_rebuild(args: argparse.Namespace) -> int:
-    snapshot_dir: Path = args.snapshot_dir.resolve()
+    snapshot_dir = _resolve_snapshot_dir_arg(args.snapshot_dir)
     if not snapshot_dir.is_dir():
         print(f"error: not a directory: {snapshot_dir}", file=sys.stderr)
         return 2
@@ -955,6 +1453,7 @@ def _build_main_parser() -> argparse.ArgumentParser:
         prog="staticnervemap",
         description="Static analysis to yaml for AI-assisted modification bootstrap.",
     )
+    parser.add_argument("--version", action="version", version=f"staticnervemap {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
     analyze_parser = subparsers.add_parser(
@@ -990,6 +1489,11 @@ def _build_main_parser() -> argparse.ArgumentParser:
     create_parser.add_argument("--roadmap-ref", type=str, default=None, help="Roadmap reference")
     create_parser.add_argument("--change-reason", type=str, default="", help="Why this snapshot was taken")
     create_parser.add_argument("--scope-note", type=str, default="", help="Scope note")
+    create_parser.add_argument(
+        "--no-overwrite",
+        action="store_true",
+        help="Fail if the target snapshot file already exists.",
+    )
     create_parser.add_argument(
         "--scan-mode",
         type=str,

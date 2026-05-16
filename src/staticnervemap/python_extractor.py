@@ -120,25 +120,38 @@ LOW_VALUE_DYNAMIC_METHODS = {
 }
 
 LOW_SIGNAL_DYNAMIC_METHODS = {
+    "add_parser",
+    "add_subparsers",
     "contiguous",
     "cpu",
+    "end",
     "find",
+    "glob",
     "get_tensor",
     "getvalue",
     "imshow",
     "index",
     "is_dir",
+    "lstrip",
+    "partition",
     "put",
     "readline",
     "remove",
     "rename",
+    "removeprefix",
     "repeat",
     "reshape",
     "result",
+    "rsplit",
     "search",
     "setLevel",
+    "set_defaults",
+    "setdefault",
+    "splitlines",
+    "start",
     "isalpha",
     "isascii",
+    "isupper",
     "upper",
     "writerow",
     "writelines",
@@ -167,6 +180,11 @@ PATH_LIKE_METHODS = {
 
 ROUTE_DECORATOR_ATTRS = {"route", "get", "post", "put", "patch", "delete", "options", "head"}
 COMMAND_DECORATOR_ATTRS = {"command", "group"}
+ROUTE_BINDER_NAME_HINTS = {"app", "router", "bp", "blueprint", "api"}
+COMMAND_BINDER_NAME_HINTS = {"app", "cli", "typer"}
+ROUTE_BIND_MODULE_PREFIXES = ("fastapi", "flask", "quart", "sanic", "starlette")
+COMMAND_BIND_MODULE_PREFIXES = ("click", "typer")
+TEST_DECORATOR_MODULE_PREFIXES = ("mock", "unittest.mock", "pytest", "pytest_mock")
 FRAMEWORK_ENTRY_FUNCTIONS = {
     "setup",
     "async_setup",
@@ -501,7 +519,9 @@ class RelationCollector(ast.NodeVisitor):
         qn = f"{self._current_qualified_prefix()}.{node.name}"
         sym_id = f"{kind}:{qn}"
         self._emit_decorator_binds(node, sym_id)
+        self._emit_dependency_binds(node, sym_id)
         self._maybe_emit_framework_entrypoint(node, sym_id)
+        self._maybe_emit_django_management_entrypoint(node, sym_id)
         self._scope_stack.append(_Scope(kind=kind, name=node.name, symbol_id=sym_id))
         receiver_bindings = self._seed_receiver_bindings_from_params(node.args, sym_id)
         self._receiver_bindings_stack.append(receiver_bindings)
@@ -553,6 +573,7 @@ class RelationCollector(ast.NodeVisitor):
         if class_qn is not None:
             for target in node.targets:
                 self._bind_receiver_target(target, class_qn)
+        self._maybe_emit_django_urlpatterns(node)
         self.generic_visit(node)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
@@ -636,7 +657,7 @@ class RelationCollector(ast.NodeVisitor):
             Unresolved(
                 id=f"unresolved:{self.file.module}:ui_bind:{func.attr}:{node.lineno}",
                 target=caller_id,
-                reason=f"Gradio .{func.attr}() の fn 引数を静的解決できない ({reason})",
+                reason=f"Gradio .{func.attr}() fn argument could not be resolved statically ({reason})",
                 severity="low",
             )
         )
@@ -787,7 +808,7 @@ class RelationCollector(ast.NodeVisitor):
             Unresolved(
                 id=f"unresolved:{self.file.module}:dynamic_call:{node.lineno}:{node.func.attr}",
                 target=caller_id,
-                reason=f"receiver 型を静的に解決できない method call: {expr}",
+                reason=f"receiver type could not be resolved statically for method call: {expr}",
                 severity=self._dynamic_unresolved_severity(name, node.func.attr),
                 line_hint=node.lineno,
             )
@@ -843,13 +864,36 @@ class RelationCollector(ast.NodeVisitor):
     def _dynamic_unresolved_severity(self, receiver_name: str, method_name: str) -> str:
         if method_name in LOW_SIGNAL_DYNAMIC_METHODS:
             return "low"
-        if receiver_name.endswith("_set") and method_name == "add":
+        if receiver_name.isupper() and method_name in {"union", "intersection", "difference"}:
+            return "low"
+        if method_name == "add" and (
+            receiver_name.endswith("_set")
+            or receiver_name.endswith("_ids")
+            or receiver_name in {"modules", "by_param"}
+            or receiver_name.startswith(("seen", "visited", "members", "imported", "excluded", "reachable"))
+        ):
+            return "low"
+        if receiver_name.endswith(("_files", "_keys", "_entries", "_modules")) and method_name in {"add", "setdefault"}:
+            return "low"
+        if receiver_name.endswith(("_has_init", "_paths")) and method_name in {"add", "setdefault"}:
+            return "low"
+        if receiver_name.endswith("_dir") and method_name == "glob":
+            return "low"
+        if receiver_name in {"snapshot_dir", "lookup", "queue", "parser", "subparsers", "snapshot_sub"} and method_name in {
+            "glob",
+            "resolve_file_id",
+            "popleft",
+            "add_parser",
+            "add_subparsers",
+        }:
+            return "low"
+        if receiver_name.endswith(("_parser", "_sub")) and method_name in {"set_defaults", "add_parser", "add_subparsers"}:
             return "low"
         if receiver_name.endswith("_queue") and method_name in {"put", "get", "task_done", "empty", "join"}:
             return "low"
-        if receiver_name.endswith(("_path", "_dir", "_file", "_folder")) and method_name in {"is_dir", "rename"}:
+        if receiver_name.endswith(("_path", "_dir", "_file", "_folder")) and method_name in {"is_dir", "rename", "read_text", "resolve"}:
             return "low"
-        if receiver_name in {"word", "pattern", "writer", "mpl_logger", "h", "ch"}:
+        if receiver_name in {"word", "pattern", "writer", "mpl_logger", "h", "ch", "root", "gitignore"}:
             return "low"
         return "medium"
 
@@ -873,7 +917,7 @@ class RelationCollector(ast.NodeVisitor):
                 symbol_id=self.file.id,
                 kind="gradio_entrypoint",
                 priority=1,
-                reason="Gradio アプリの module-level launch() を検出",
+                reason="Detected module-level Gradio app launch()",
             )
         )
 
@@ -955,6 +999,8 @@ class RelationCollector(ast.NodeVisitor):
             info = _decorator_bind_info(deco)
             if info is None:
                 continue
+            if not self._should_emit_decorator_bind(info):
+                continue
             rel_type = "route_binds" if info["kind"] == "route" else "command_binds"
             rid = _rel_id(rel_type, self.file.id, symbol_id, str(node.lineno), info["decorator"])
             self.state.relations.append(
@@ -970,6 +1016,74 @@ class RelationCollector(ast.NodeVisitor):
                         "binder_source": info["binder_source"],
                         "bind_attr": info["bind_attr"],
                         "literal_args": info["literal_args"],
+                    },
+                )
+            )
+
+    def _should_emit_decorator_bind(self, info: dict[str, object]) -> bool:
+        binder_source = str(info["binder_source"])
+        bind_kind = str(info["kind"])
+
+        if self._is_test_decorator_binder(binder_source):
+            return False
+
+        if bind_kind == "route":
+            return self._is_framework_like_binder(
+                binder_source,
+                local_hints=ROUTE_BINDER_NAME_HINTS,
+                module_prefixes=ROUTE_BIND_MODULE_PREFIXES,
+            )
+        if bind_kind == "command":
+            return self._is_framework_like_binder(
+                binder_source,
+                local_hints=COMMAND_BINDER_NAME_HINTS,
+                module_prefixes=COMMAND_BIND_MODULE_PREFIXES,
+            )
+        return False
+
+    def _is_test_decorator_binder(self, binder_source: str) -> bool:
+        if binder_source in {"mock", "mocker", "patch"}:
+            return True
+        binding = self.bindings.get(binder_source)
+        if binding is None:
+            return False
+        return _binding_matches_prefixes(binding, TEST_DECORATOR_MODULE_PREFIXES)
+
+    def _is_framework_like_binder(
+        self,
+        binder_source: str,
+        *,
+        local_hints: set[str],
+        module_prefixes: tuple[str, ...],
+    ) -> bool:
+        binding = self.bindings.get(binder_source)
+        if binding is not None:
+            return _binding_matches_prefixes(binding, module_prefixes)
+        return _matches_binder_name_hint(binder_source, local_hints)
+
+    def _emit_dependency_binds(
+        self, node: ast.FunctionDef | ast.AsyncFunctionDef, symbol_id: str
+    ) -> None:
+        for arg_name, default in _iter_argument_defaults(node.args):
+            dependency_node = _dependency_target_from_default(default)
+            if dependency_node is None:
+                continue
+            dependency_id = self._resolve_name_or_attr_to_symbol(dependency_node)
+            if dependency_id is None:
+                continue
+            rid = _rel_id("dependency_binds", symbol_id, dependency_id, arg_name, str(node.lineno))
+            self.state.relations.append(
+                Relation(
+                    id=rid,
+                    type="dependency_binds",
+                    from_id=symbol_id,
+                    to_id=dependency_id,
+                    confidence=0.85,
+                    provenance=auto_call_resolution(file_id=self.file.id, line=node.lineno),
+                    details={
+                        "framework": "fastapi",
+                        "param_name": arg_name,
+                        "dependency_expr": _unparse(dependency_node) or dependency_id,
                     },
                 )
             )
@@ -995,6 +1109,75 @@ class RelationCollector(ast.NodeVisitor):
                 reason=f"framework-style top-level entrypoint: {node.name}",
             )
         )
+
+    def _maybe_emit_django_management_entrypoint(
+        self,
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+        symbol_id: str,
+    ) -> None:
+        parent = self._scope_stack[-1]
+        if parent.kind != "class" or parent.name != "Command":
+            return
+        if node.name != "handle":
+            return
+        command_name = _django_management_command_name(self.file.path)
+        if command_name is None:
+            return
+        entry_id = f"entry:{self.file.module}-django-command"
+        if any(e.id == entry_id for e in self.state.entrypoints):
+            return
+        self.state.entrypoints.append(
+            Entrypoint(
+                id=entry_id,
+                symbol_id=symbol_id,
+                kind="django_management_command",
+                priority=2,
+                reason=f"Django management command entrypoint: {command_name}",
+            )
+        )
+
+    def _maybe_emit_django_urlpatterns(self, node: ast.Assign) -> None:
+        if self._scope_stack[-1].kind != "module":
+            return
+        if not any(isinstance(target, ast.Name) and target.id == "urlpatterns" for target in node.targets):
+            return
+        for call in _iter_django_urlpattern_calls(node.value):
+            info = _django_route_bind_info(call)
+            if info is None:
+                continue
+            to_id = self._resolve_django_route_target(info["target"])
+            if to_id is None:
+                continue
+            rid = _rel_id("route_binds", self.file.id, to_id, str(node.lineno), info["bind_attr"])
+            self.state.relations.append(
+                Relation(
+                    id=rid,
+                    type="route_binds",
+                    from_id=self.file.id,
+                    to_id=to_id,
+                    confidence=0.9,
+                    provenance=auto_call_resolution(file_id=self.file.id, line=node.lineno),
+                    details={
+                        "framework": "django",
+                        "surface_model": "django_urlconf",
+                        "binder_source": "urlpatterns",
+                        "bind_attr": info["bind_attr"],
+                        "literal_args": info["literal_args"],
+                    },
+                )
+            )
+
+    def _resolve_django_route_target(self, node: ast.AST) -> str | None:
+        target = self._resolve_name_or_attr_to_symbol(node)
+        if target is not None:
+            return target
+        if isinstance(node, ast.Call) and _is_django_include_call(node):
+            include_target = _django_include_target(node)
+            if isinstance(include_target, ast.Constant) and isinstance(include_target.value, str):
+                return self.resolver.resolve_module(include_target.value)
+            if include_target is not None:
+                return self._resolve_name_or_attr_to_symbol(include_target)
+        return None
 
     def _current_class_qualified_name(self) -> str | None:
         class_index = None
@@ -1108,7 +1291,7 @@ class RelationCollector(ast.NodeVisitor):
                         symbol_id=self.file.id,
                         kind="script_main",
                         priority=1,
-                        reason='if __name__ == "__main__": を検出',
+                        reason='Detected if __name__ == "__main__"',
                     )
                 )
         self.generic_visit(node)
@@ -1301,10 +1484,116 @@ def _decorator_bind_info(node: ast.AST) -> dict[str, object] | None:
     return None
 
 
+def _binding_matches_prefixes(binding: ImportBinding, prefixes: tuple[str, ...]) -> bool:
+    names = [binding.module]
+    if binding.imported_name is not None:
+        names.append(f"{binding.module}.{binding.imported_name}")
+    return any(name == prefix or name.startswith(prefix + ".") for name in names for prefix in prefixes)
+
+
+def _matches_binder_name_hint(name: str, hints: set[str]) -> bool:
+    if name in hints:
+        return True
+    return any(name.endswith(f"_{hint}") or name.startswith(f"{hint}_") for hint in hints)
+
+
+def _iter_argument_defaults(args: ast.arguments) -> list[tuple[str, ast.AST]]:
+    items: list[tuple[str, ast.AST]] = []
+
+    positional = list(args.posonlyargs) + list(args.args)
+    default_offset = len(positional) - len(args.defaults)
+    for index, default in enumerate(args.defaults):
+        arg_index = default_offset + index
+        if 0 <= arg_index < len(positional):
+            items.append((positional[arg_index].arg, default))
+
+    for arg, default in zip(args.kwonlyargs, args.kw_defaults):
+        if default is not None:
+            items.append((arg.arg, default))
+
+    return items
+
+
+def _dependency_target_from_default(default: ast.AST) -> ast.AST | None:
+    if not isinstance(default, ast.Call):
+        return None
+    if not _is_depends_call(default.func):
+        return None
+    if default.args:
+        return default.args[0]
+    for kw in default.keywords:
+        if kw.arg in {"dependency", "call"}:
+            return kw.value
+    return None
+
+
+def _is_depends_call(func: ast.AST) -> bool:
+    if isinstance(func, ast.Name):
+        return func.id == "Depends"
+    if isinstance(func, ast.Attribute):
+        return func.attr == "Depends"
+    return False
+
+
 def _literal_arg(node: ast.AST) -> str | None:
     if isinstance(node, ast.Constant):
         return repr(node.value)
     return None
+
+
+def _iter_django_urlpattern_calls(node: ast.AST) -> list[ast.Call]:
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return [elt for elt in node.elts if isinstance(elt, ast.Call)]
+    return []
+
+
+def _django_route_bind_info(node: ast.Call) -> dict[str, object] | None:
+    func = node.func
+    func_name = _simple_call_name(func)
+    if func_name not in {"path", "re_path"}:
+        return None
+    if len(node.args) < 2:
+        return None
+    return {
+        "bind_attr": func_name,
+        "target": node.args[1],
+        "literal_args": [
+            _literal_arg(node.args[0])
+        ] if node.args else [],
+    }
+
+
+def _is_django_include_call(node: ast.Call) -> bool:
+    return _simple_call_name(node.func) == "include"
+
+
+def _django_include_target(node: ast.Call) -> ast.AST | None:
+    if node.args:
+        return node.args[0]
+    for kw in node.keywords:
+        if kw.arg in {"module", "arg"}:
+            return kw.value
+    return None
+
+
+def _simple_call_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
+
+
+def _django_management_command_name(path: str) -> str | None:
+    parts = path.split("/")
+    if len(parts) < 4:
+        return None
+    if parts[-3:-1] != ["management", "commands"]:
+        return None
+    name = parts[-1]
+    if not name.endswith(".py") or name == "__init__.py":
+        return None
+    return name[:-3]
 
 
 def _describe_event_source(node: ast.AST) -> dict[str, str]:
@@ -1361,7 +1650,7 @@ def _should_emit_module_constant(name: str) -> bool:
 
 def parse_file(path: Path) -> ast.Module | None:
     try:
-        source = path.read_text(encoding="utf-8")
+        source = path.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeDecodeError):
         return None
     try:

@@ -40,7 +40,7 @@ def build_api_contracts(
                     "id": f"contract:return:{qn}",
                     "symbol_id": symbol.id,
                     "kind": "return_annotation",
-                    "summary": f"戻り値注釈は `{symbol.return_type}`",
+                    "summary": f"Return annotation: `{symbol.return_type}`",
                     "confidence": 0.95,
                 }
             )
@@ -54,7 +54,7 @@ def build_api_contracts(
                         "id": f"contract:params:{qn}",
                         "symbol_id": symbol.id,
                         "kind": "parameter_contract",
-                        "summary": f"主要パラメータ注釈: {param_desc}",
+                        "summary": f"Typed parameters: {param_desc}",
                         "confidence": 0.9,
                     }
                 )
@@ -65,7 +65,10 @@ def build_api_contracts(
                     "id": f"contract:generator:{qn}",
                     "symbol_id": symbol.id,
                     "kind": "generator_protocol",
-                    "summary": "generator 的に途中経過や完了結果を順次返す可能性が高い",
+                    "summary": (
+                        "Likely generator-style protocol returning progress or "
+                        "completion values incrementally"
+                    ),
                     "confidence": 0.75,
                 }
             )
@@ -89,7 +92,7 @@ def build_api_contracts(
                     "id": f"contract:external:{file_entry.module}",
                     "symbol_id": file_id,
                     "kind": "external_api_assumption",
-                    "summary": f"外部依存 `{', '.join(externals[:4])}` の API 契約に影響される",
+                    "summary": f"Depends on external API contracts from `{', '.join(externals[:4])}`",
                     "confidence": 0.8,
                 }
             )

@@ -108,17 +108,14 @@ def _prefix_groups(files: list[FileEntry]) -> dict[str, list[str]]:
 
 
 def _cluster_prefix(file_entry: FileEntry) -> str:
+    module = file_entry.module
+    if module:
+        return module.split(".", 1)[0]
     path = file_entry.path
     parts = [part for part in path.split("/") if part]
-    if len(parts) >= 2 and parts[0] == "src":
-        return f"{parts[0]}.{parts[1]}"
     if len(parts) >= 2:
         return parts[0]
-    module = file_entry.module
-    if "." in module:
-        first, second = module.split(".", 1)
-        return f"{first}.{second.split('.', 1)[0]}"
-    return module
+    return path
 
 
 def _support_members(files: list[FileEntry]) -> list[str]:

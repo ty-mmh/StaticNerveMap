@@ -137,10 +137,10 @@ def build_change_targets(
     selected = core_runtime_candidates[:3]
     if len(selected) < 3:
         selected.extend(boundary_runtime_candidates[: 3 - len(selected)])
-    if len(selected) < 3:
-        selected.extend(support_runtime_candidates[: 3 - len(selected)])
     if not selected and boundary_runtime_candidates:
         selected.extend(boundary_runtime_candidates[:3])
+    if not selected:
+        selected.extend(support_runtime_candidates[:3])
     runtime_primary = [file_entry.id for file_entry in selected]
     runtime_primary_set = set(runtime_primary)
 
@@ -153,6 +153,7 @@ def build_change_targets(
             and from_file_id not in runtime_primary_set
             and from_file_id in boundary_file_ids
         }
+        | {file_entry.id for file_entry in support_runtime_candidates if file_entry.id not in runtime_primary_set}
     )
 
     change_targets: list[dict[str, object]] = []
@@ -346,16 +347,22 @@ def _effective_runtime_score(
     if file_entry.id in boundary_file_ids:
         base -= 0.75
     base -= _utility_penalty(file_entry.path)
+    base -= _support_path_penalty(file_entry.path)
     return base
 
 
 def _utility_penalty(path: str) -> float:
-    name = path.rsplit("/", 1)[-1].lower()
+    normalized = path.lower()
+    name = normalized.rsplit("/", 1)[-1]
     penalty = 0.0
     if name in {"__init__.py", "utils.py", "helpers.py", "common.py"}:
         penalty += 1.0
     if "util" in name or "helper" in name:
         penalty += 0.4
+    if "/migrations/" in normalized or normalized.startswith("migrations/"):
+        penalty += 2.0
+    if name == "tests.py" or name.startswith("test_") or name.endswith(("_test.py", "_tests.py")):
+        penalty += 2.0
     return penalty
 
 
@@ -369,14 +376,60 @@ def _is_runtime_candidate(
         return False
     path = file_entry.path
     name = path.rsplit("/", 1)[-1]
+    if _is_migration_like_path(path):
+        return False
     if path == "config.py" or name == "__init__.py":
         return False
     return path.endswith(".py")
 
 
 def _is_support_runtime_file(file_entry: FileEntry) -> bool:
+    if _is_support_like_runtime_path(file_entry.path):
+        return True
     name = file_entry.path.rsplit("/", 1)[-1].lower()
     return name in {"utils.py", "helpers.py", "common.py"} or "util" in name or "helper" in name
+
+
+def _is_migration_like_path(path: str) -> bool:
+    normalized = path.lower()
+    return "/migrations/" in normalized or normalized.startswith("migrations/")
+
+
+def _support_path_penalty(path: str) -> float:
+    normalized = path.lower()
+    parts = [part for part in normalized.split("/") if part]
+    penalty = 0.0
+    if any(part in {"vendor", "_vendor", "vendored"} for part in parts[:-1]):
+        penalty += 6.0
+    if any(part in {"example", "examples", "typing-examples", "benchmark", "benchmarks"} for part in parts[:-1]):
+        penalty += 4.0
+    if _is_docs_plugin_path(parts):
+        penalty += 4.0
+    if _is_task_runner_root_file(parts):
+        penalty += 4.0
+    return penalty
+
+
+def _is_support_like_runtime_path(path: str) -> bool:
+    normalized = path.lower()
+    parts = [part for part in normalized.split("/") if part]
+    return (
+        any(
+            part
+            in {"vendor", "_vendor", "vendored", "example", "examples", "typing-examples", "benchmark", "benchmarks"}
+            for part in parts[:-1]
+        )
+        or _is_docs_plugin_path(parts)
+        or _is_task_runner_root_file(parts)
+    )
+
+
+def _is_docs_plugin_path(parts: list[str]) -> bool:
+    return len(parts) >= 3 and parts[0] in {"doc", "docs"} and parts[1] == "plugins"
+
+
+def _is_task_runner_root_file(parts: list[str]) -> bool:
+    return len(parts) == 1 and parts[0] in {"noxfile.py", "toxfile.py"}
 
 
 def default_impact_rules() -> list[dict[str, str]]:

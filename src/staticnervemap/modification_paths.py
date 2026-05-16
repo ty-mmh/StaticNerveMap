@@ -32,7 +32,7 @@ def build_modification_paths(
 
     call_graph: dict[str, list[tuple[str, str]]] = defaultdict(list)
     for rel in relations:
-        if rel.type != "calls":
+        if rel.type not in {"calls", "dependency_binds"}:
             continue
         call_graph[rel.from_id].append((rel.to_id, rel.id))
 
@@ -69,6 +69,47 @@ def build_modification_paths(
                     "trigger_source": trigger_source,
                     "handler_symbol_id": handler_id,
                     "event_method": event_method,
+                    "event_source": event_source,
+                    "path": node_path,
+                    "relation_path": relation_path,
+                    "target_file": target_file,
+                    "priority": _path_priority(
+                        node_path, target_file, runtime_primary, subsystem_primary
+                    ),
+                }
+            )
+
+    for rel in relations:
+        if rel.type not in {"route_binds", "command_binds"}:
+            continue
+        handler_id = rel.to_id
+        if not handler_id.startswith(("function:", "method:")):
+            continue
+
+        trigger_source = rel.from_id
+        details = rel.details or {}
+        bind_attr = str(details.get("bind_attr", ""))
+        event_source = _bind_event_source(rel, details)
+        path_kind = "route_to_runtime" if rel.type == "route_binds" else "command_to_runtime"
+        discovered = _discover_runtime_paths(
+            handler_id,
+            call_graph,
+            symbol_to_file,
+            destination_files,
+        )
+        for node_path, relation_path, target_file in discovered:
+            dedupe_key = (trigger_source, target_file, tuple(node_path))
+            if dedupe_key in seen_keys:
+                continue
+            seen_keys.add(dedupe_key)
+            paths.append(
+                {
+                    "id": f"path:{rel.id}:{len(paths)+1}",
+                    "kind": path_kind,
+                    "trigger_relation_id": rel.id,
+                    "trigger_source": trigger_source,
+                    "handler_symbol_id": handler_id,
+                    "event_method": bind_attr,
                     "event_source": event_source,
                     "path": node_path,
                     "relation_path": relation_path,
@@ -125,6 +166,16 @@ def build_modification_paths(
         )
     )
     return paths
+
+
+def _bind_event_source(rel: Relation, details: dict[str, object]) -> str:
+    literal_args = details.get("literal_args")
+    if isinstance(literal_args, list) and literal_args:
+        return str(literal_args[0])
+    decorator = details.get("decorator")
+    if decorator:
+        return str(decorator)
+    return rel.from_id
 
 
 def _discover_runtime_paths(

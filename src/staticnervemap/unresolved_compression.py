@@ -12,15 +12,27 @@ MEDIUM_DETAIL_KEEP_PER_FILE = 2
 MEDIUM_SUMMARY_THRESHOLD = 6
 COMPRESS_TRIGGER_THRESHOLD = 500
 LOW_SIGNAL_MEDIUM_METHODS = {
+    "all",
+    "annotate",
+    "defer",
+    "distinct",
+    "exclude",
+    "filter",
+    "only",
+    "order_by",
+    "prefetch_related",
     "where",
     "run",
     "select",
+    "select_related",
     "orderby",
     "groupby",
     "limit",
     "offset",
     "as_dict",
     "precision",
+    "values",
+    "values_list",
 }
 
 

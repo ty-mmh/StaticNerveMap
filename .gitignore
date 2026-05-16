@@ -12,3 +12,6 @@ tests
 docs
 src/staticnervemap.egg-info
 *.yaml
+AgentCLI.md
+dogfood/*
+repo-selection.md

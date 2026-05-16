@@ -40,6 +40,12 @@ DEFAULT_EXCLUDED_DIRS = {
 
 ENTRY_NAMES = {"app.py", "main.py", "__main__.py", "run.py", "server.py"}
 CONFIG_NAMES = {"config.py", "settings.py", "conf.py"}
+DEFAULT_EXCLUDED_FILE_PATTERNS = (
+    "tests.py",
+    "*_test.py",
+    "test_*.py",
+    "*_tests.py",
+)
 
 
 def _rel_posix(root: Path, path: Path) -> str:
@@ -49,6 +55,8 @@ def _rel_posix(root: Path, path: Path) -> str:
 def _module_name(rel_posix: str) -> str:
     stem = rel_posix[:-3] if rel_posix.endswith(".py") else rel_posix
     parts = [p for p in stem.split("/") if p and p != "__init__"]
+    if parts and parts[0] == "src":
+        parts = parts[1:]
     return ".".join(parts)
 
 
@@ -58,9 +66,23 @@ def _role_for(rel_posix: str) -> str:
         return "entrypoint_candidate"
     if name in CONFIG_NAMES:
         return "configuration"
-    if rel_posix.startswith("tests/") or name.startswith("test_") or name.endswith("_test.py"):
+    if rel_posix.startswith("tests/") or _is_test_like_python_file(name):
         return "test"
     return "source"
+
+
+def _is_test_like_python_file(name: str) -> bool:
+    return (
+        name == "tests.py"
+        or name.startswith("test_")
+        or name.endswith("_test.py")
+        or name.endswith("_tests.py")
+    )
+
+
+def _is_default_excluded_python_file(rel_posix: str) -> bool:
+    name = rel_posix.rsplit("/", 1)[-1]
+    return _is_test_like_python_file(name)
 
 
 def _load_gitignore_excluded_dirs(root: Path) -> set[str]:
@@ -96,16 +118,25 @@ def _top_level_dir(rel_posix: str) -> str | None:
     return None
 
 
+def _package_root_for(file_entry: FileEntry) -> str | None:
+    parts = file_entry.path.split("/")
+    if len(parts) < 2:
+        return None
+    if parts[0] == "src" and len(parts) >= 3:
+        return "/".join(parts[:2])
+    return parts[0]
+
+
 def _choose_primary_packages(files: list[FileEntry]) -> set[str]:
     package_counts: dict[str, int] = {}
     package_has_init: set[str] = set()
     for file_entry in files:
-        top = _top_level_dir(file_entry.path)
-        if top is None:
+        package_root = _package_root_for(file_entry)
+        if package_root is None:
             continue
-        package_counts[top] = package_counts.get(top, 0) + 1
-        if file_entry.path == f"{top}/__init__.py":
-            package_has_init.add(top)
+        package_counts[package_root] = package_counts.get(package_root, 0) + 1
+        if file_entry.path == f"{package_root}/__init__.py":
+            package_has_init.add(package_root)
 
     candidates = [
         (count, name)
@@ -149,7 +180,7 @@ def _collect_local_import_modules_ast(
 ) -> set[str]:
     path = root / file_entry.path
     try:
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        tree = ast.parse(path.read_text(encoding="utf-8-sig"), filename=str(path))
     except (OSError, SyntaxError, UnicodeDecodeError):
         return set()
 
@@ -202,7 +233,7 @@ def _collect_local_import_modules(
 ) -> set[str]:
     path = root / file_entry.path
     try:
-        text = path.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeDecodeError):
         return set()
 
@@ -340,6 +371,8 @@ def scan_repo(
                 continue
             fpath = Path(dirpath) / fname
             rel = _rel_posix(root, fpath)
+            if scan_mode != "full" and _is_default_excluded_python_file(rel):
+                continue
             module = _module_name(rel) or fname[:-3]
             files.append(
                 FileEntry(
@@ -359,17 +392,17 @@ def scan_repo(
     reachable_modules = _expand_reachable_modules(root, files)
     focused_files: list[FileEntry] = []
     for file_entry in files:
-        top = _top_level_dir(file_entry.path)
+        package_root = _package_root_for(file_entry)
         if file_entry.role in {"entrypoint_candidate", "configuration"}:
             focused_files.append(file_entry)
             continue
         if file_entry.module in reachable_modules:
             focused_files.append(file_entry)
             continue
-        if top is None:
+        if package_root is None:
             focused_files.append(file_entry)
             continue
-        if top in primary_packages:
+        if package_root in primary_packages:
             focused_files.append(file_entry)
     return focused_files
 
